@@ -45,6 +45,10 @@ contract MockSwap is IStrikeSwap {
         if (reenter) {
             (reentrySucceeded,) = address(strike).call(abi.encodeCall(Strike.processFees, (1, 1)));
             require(!reentrySucceeded, "reentered");
+            (reentrySucceeded,) = address(strike).call(abi.encodeCall(Strike.processStrikeBurn, (1)));
+            require(!reentrySucceeded, "burn reentered");
+            (reentrySucceeded,) = address(strike).call(abi.encodeCall(Strike.executeStrikeBurn, (1)));
+            require(!reentrySucceeded, "self-call bypass");
         }
         IERC20(input).transferFrom(msg.sender, address(this), amount);
         IERC20 output = input == address(strike) ? imd : strike;
@@ -129,6 +133,7 @@ contract StrikeTest is Test {
         assertGe(
             imd.balanceOf(address(token)),
             token.fund() + token.rewardLiability() + token.streamBudget() - token.streamReleased()
+                + token.pendingStrikeBurn()
         );
         assertLe(token.totalSupply(), token.INITIAL_SUPPLY());
     }
@@ -480,28 +485,157 @@ contract StrikeTest is Test {
         _assertSolvent();
     }
 
-    function testDailyCadenceRejectsAdjacentUtcDays() public {
+    function testDailyCadenceAcceptsAdjacentUtcDaysAndRejectsReplay() public {
         _fees();
         vm.warp((vm.getBlockTimestamp() / 1 days + 1) * 1 days - 10);
         _answer(1);
         vm.warp(vm.getBlockTimestamp() + 20);
         uint256 day = vm.getBlockTimestamp() / 1 days;
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, token.answerDigest(1, vm.getBlockTimestamp(), day));
-        vm.expectRevert(Strike.TooSoon.selector);
+        token.submitOvertime(1, vm.getBlockTimestamp(), day, abi.encodePacked(r, s, v));
+        assertTrue(token.usedDay(day));
+        vm.expectRevert(Strike.InvalidAnswer.selector);
         token.submitOvertime(1, vm.getBlockTimestamp(), day, abi.encodePacked(r, s, v));
     }
 
-    function testOracleSwapFailureRollsBackReplayProtection() public {
+    function testOracleSwapFailureDefersBurnAndPreservesAnswerAndRewards() public {
         _fees();
+        _stake(alice, 100 ether, 7);
         adapter.setBehavior(1, false, false);
         uint256 day = vm.getBlockTimestamp() / 1 days;
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, token.answerDigest(20, vm.getBlockTimestamp(), day));
+        token.submitOvertime(20, vm.getBlockTimestamp(), day, abi.encodePacked(r, s, v));
+        assertTrue(token.usedDay(day));
+        assertEq(token.fund(), 980 ether);
+        assertEq(token.pendingStrikeBurn(), 10 ether);
+        assertEq(token.streamBudget(), 10 ether);
+        assertEq(imd.balanceOf(address(token)), 1000 ether);
+        assertEq(imd.allowance(address(token), address(adapter)), 0);
         vm.expectRevert(Strike.SwapFailed.selector);
+        token.processStrikeBurn(5 ether);
+        assertEq(token.pendingStrikeBurn(), 10 ether);
+        assertEq(imd.allowance(address(token), address(adapter)), 0);
+        vm.expectRevert(Strike.InvalidAnswer.selector);
         token.submitOvertime(20, vm.getBlockTimestamp(), day, abi.encodePacked(r, s, v));
-        assertFalse(token.usedDay(day));
-        assertEq(token.fund(), 1000 ether);
         adapter.setBehavior(10_000, false, false);
-        token.submitOvertime(20, vm.getBlockTimestamp(), day, abi.encodePacked(r, s, v));
+        uint256 supply = token.totalSupply();
+        token.processStrikeBurn(3 ether);
+        assertEq(token.pendingStrikeBurn(), 7 ether);
+        token.processStrikeBurn(type(uint256).max);
+        assertEq(token.pendingStrikeBurn(), 0);
+        assertEq(supply - token.totalSupply(), 10 ether);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        vm.prank(alice);
+        token.exit();
+        assertEq(imd.balanceOf(alice), 10 ether);
+        _assertSolvent();
+    }
+
+    function testPoolManagerMarketRoutesAndOperatorPayDues() public {
+        token.transfer(manager, 30_000 ether);
+        uint256 supply = token.totalSupply();
+        vm.prank(manager);
+        token.transfer(market, 10_000 ether);
+        vm.prank(market);
+        token.transfer(manager, 10_000 ether);
+        vm.prank(alice);
+        token.approve(manager, 10_000 ether);
+        vm.prank(manager);
+        token.transferFrom(alice, market, 10_000 ether);
+        assertEq(token.pendingFund(), 300 ether);
+        assertEq(token.pendingImdBurn(), 150 ether);
+        assertEq(supply - token.totalSupply(), 150 ether);
+        _assertSolvent();
+    }
+
+    function testFallbackLeavesSignerRecoveryWindow() public {
+        vm.warp(token.genesis() + 2 days);
+        token.fallbackOvertime();
+        uint256 fallbackAt = vm.getBlockTimestamp();
+        vm.warp(fallbackAt + 1 days);
+        vm.expectRevert(Strike.TooSoon.selector);
+        token.fallbackOvertime();
+        _answer(15);
+        assertEq(token.lastAnswerAt(), vm.getBlockTimestamp());
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+        token.fallbackOvertime();
+        vm.warp(vm.getBlockTimestamp() + 2 days - 1);
+        vm.expectRevert(Strike.TooSoon.selector);
+        token.fallbackOvertime();
+        vm.warp(vm.getBlockTimestamp() + 1);
+        token.fallbackOvertime();
+    }
+
+    function testFallbackAndBargainDeferUnavailableMarket() public {
+        _fees();
+        _stake(alice, 100 ether, 30);
+        adapter.setBehavior(10_000, true, false);
+        vm.warp(token.genesis() + 2 days);
+        token.fallbackOvertime();
+        assertEq(token.pendingStrikeBurn(), 0.5 ether);
+        assertEq(token.fund(), 999 ether);
+        vm.warp(token.genesis() + 7 days);
+        assertEq(token.executeBargain(0), 0);
+        (, bool executed) = token.ballot(0);
+        assertTrue(executed);
+        assertEq(token.pendingStrikeBurn(), 10.49 ether);
+        assertEq(token.fund(), 989.01 ether);
+        _assertSolvent();
+    }
+
+    function testBurnQueueAccessReentrancyAndEmptyActions() public {
+        vm.expectRevert(Strike.SwapFailed.selector);
+        token.executeStrikeBurn(1);
+        vm.expectRevert(Strike.InvalidAmount.selector);
+        token.processStrikeBurn(0);
+        vm.expectRevert(Strike.InvalidAmount.selector);
+        token.processStrikeBurn(type(uint256).max);
+        _fees();
+        adapter.setBehavior(10_000, true, false);
+        _answer(20);
+        adapter.setBehavior(10_000, false, true);
+        token.processStrikeBurn(type(uint256).max);
+        assertFalse(adapter.reentrySucceeded());
+        assertEq(token.pendingStrikeBurn(), 0);
+        _assertSolvent();
+    }
+
+    function testMaturedPositionRetainsItsPromisedWeightUntilExit() public {
+        _fees();
+        _stake(alice, 100 ether, 180);
+        vm.warp(vm.getBlockTimestamp() + 181 days);
+        _stake(bob, 100 ether, 7);
+        assertEq(token.totalWeight(), 500 ether);
+        _answer(20);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        assertEq(token.earned(alice), 4 * token.earned(bob));
+        uint256 beforeBalance = token.balanceOf(alice);
+        vm.prank(alice);
+        token.exit();
+        assertEq(token.balanceOf(alice) - beforeBalance, 100 ether);
+    }
+
+    function testFuzzEachDailyStreamFinishesWithinSevenDays(uint64 jobsSeed) public {
+        _fees();
+        _stake(alice, 100 ether, 180);
+        uint256 start = vm.getBlockTimestamp();
+        uint256 expectedUnreleased;
+        uint256 totalStreams;
+        for (uint256 i; i < 8; ++i) {
+            vm.warp(start + i * 1 days);
+            uint256 jobs = 1 + (uint256(jobsSeed) >> (i * 8)) % 30;
+            uint256 spend = jobs * 1 ether;
+            if (spend > token.fund() / 50) spend = token.fund() / 50;
+            uint256 stream = spend - spend / 2;
+            totalStreams += stream;
+            expectedUnreleased += stream - stream * (7 - i) / 7;
+            _answer(jobs);
+        }
+        assertEq(token.streamBudget() - token.streamReleased(), expectedUnreleased);
+        assertApproxEqAbs(token.earned(alice), totalStreams - expectedUnreleased, 8);
+        vm.warp(start + 14 days);
+        assertApproxEqAbs(token.earned(alice), totalStreams, 10);
+        _assertSolvent();
     }
 
     function testVoteUsesStakeAndRankNotRewardMultiplierAndLocksPosition() public {

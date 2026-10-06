@@ -49,6 +49,7 @@ contract PairModel {
         require(!entered, "locked");
         entered = true;
         require((out0 > 0 || out1 > 0) && out0 < reserve0 && out1 < reserve1, "output");
+        require(to != token0 && to != token1, "UniswapV2: INVALID_TO");
         if (out0 != 0) IERC20(token0).transfer(to, out0);
         if (out1 != 0) IERC20(token1).transfer(to, out1);
         uint256 b0 = IERC20(token0).balanceOf(address(this));

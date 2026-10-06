@@ -70,6 +70,17 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
     mapping(uint256 => Ballot) private ballots;
     mapping(uint256 => mapping(address => bool)) public voted;
 
+    // IMD already committed to STRIKE burns, excluded from the free fund and rewards.
+    uint256 public pendingStrikeBurn;
+
+    struct RewardStream {
+        uint256 amount;
+        uint256 released;
+        uint256 start;
+    }
+    // At most eight daily and two weekly streams can overlap a seven-day window.
+    RewardStream[] private rewardStreams;
+
     error InvalidConfiguration();
     error InvalidAmount();
     error InvalidLock();
@@ -90,6 +101,8 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
     event Overtime(uint256 indexed day, uint256 jobs, uint256 spent, bool fallbackUsed);
     event VoteCast(uint256 indexed week, address indexed account, uint8 option, uint256 weight);
     event Bargained(uint256 indexed week, uint8 winner, uint256 spent);
+    event StrikeBurnDeferred(uint256 imdInput);
+    event StrikeBurnProcessed(uint256 imdInput, uint256 strikeBurned);
 
     constructor(
         address factory_,
@@ -160,10 +173,12 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
     }
 
     function _exempt(address from, address to) private view returns (bool) {
-        if (
-            msg.sender == factory || from == factory || to == factory || msg.sender == poolManager
-                || from == poolManager || to == poolManager || from == address(this) || to == address(this)
-        ) return true;
+        if (msg.sender == factory || from == factory || to == factory || from == address(this) || to == address(this)) {
+            return true;
+        }
+        // _exempt is only consulted for market transfers. PoolManager routing must pay dues too.
+        // The adapter uses custody only for treasury output; public swaps cannot name it as recipient.
+        if (from == market && msg.sender == market && to == address(swapAdapter)) return true;
         // A missing or reverting distributor lookup cannot disable transfers.
         bytes memory data = abi.encodeWithSignature("distributorOf(uint64)", launchNumber);
         address target = factory;
@@ -222,6 +237,33 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
         if (output < minimum || source.balanceOf(address(this)) != beforeInput - input) revert SwapFailed();
     }
 
+    /// @notice Drain earmarked IMD in caller-bounded batches under the unchanged TWAP floor.
+    function processStrikeBurn(uint256 maxInput) external nonReentrant {
+        _processStrikeBurn(Math.min(maxInput, pendingStrikeBurn));
+    }
+
+    /// @dev Self-call isolates failed swaps, including approvals and balance changes, atomically.
+    function executeStrikeBurn(uint256 input) external {
+        if (msg.sender != address(this)) revert SwapFailed();
+        _processStrikeBurn(input);
+    }
+
+    function _processStrikeBurn(uint256 input) private {
+        if (input == 0) revert InvalidAmount();
+        pendingStrikeBurn -= input;
+        uint256 bought = _swap(address(imd), input);
+        super._update(address(this), address(0), bought);
+        emit StrikeBurnProcessed(input, bought);
+    }
+
+    function _buyBurnOrDefer(uint256 input) private {
+        pendingStrikeBurn += input;
+        try this.executeStrikeBurn(input) {}
+        catch {
+            emit StrikeBurnDeferred(input);
+        }
+    }
+
     function stake(uint256 amount, uint256 lockDays) external nonReentrant {
         if (amount == 0) revert InvalidAmount();
         if (stakes[msg.sender].amount != 0) revert ActiveStake();
@@ -243,14 +285,34 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
     }
 
     function _vested() private view returns (uint256) {
-        if (streamEnd == 0) return 0;
-        return Math.mulDiv(streamBudget, Math.min(block.timestamp, streamEnd) - streamStart, WEEK);
+        uint256 vested = streamReleased;
+        for (uint256 i; i < rewardStreams.length; ++i) {
+            RewardStream storage tranche = rewardStreams[i];
+            vested += _trancheVested(tranche) - tranche.released;
+        }
+        return vested;
+    }
+
+    function _trancheVested(RewardStream storage tranche) private view returns (uint256) {
+        return Math.mulDiv(tranche.amount, Math.min(block.timestamp - tranche.start, WEEK), WEEK);
     }
 
     function _checkpoint() private {
-        uint256 vested = _vested();
-        uint256 newlyVested = vested - streamReleased;
-        streamReleased = vested;
+        uint256 newlyVested;
+        uint256 i;
+        while (i < rewardStreams.length) {
+            RewardStream storage tranche = rewardStreams[i];
+            uint256 vested = _trancheVested(tranche);
+            newlyVested += vested - tranche.released;
+            if (vested == tranche.amount) {
+                rewardStreams[i] = rewardStreams[rewardStreams.length - 1];
+                rewardStreams.pop();
+            } else {
+                tranche.released = vested;
+                ++i;
+            }
+        }
+        streamReleased += newlyVested;
         _distribute(newlyVested);
     }
 
@@ -323,14 +385,15 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
         streamReleased = 0;
         streamStart = block.timestamp;
         streamEnd = block.timestamp + WEEK;
-        emit StreamStarted(streamBudget, streamEnd);
+        rewardStreams.push(RewardStream(amount, 0, block.timestamp));
+        emit StreamStarted(amount, streamEnd);
     }
 
     function answerDigest(uint256 jobs, uint256 observedAt, uint256 day) public view returns (bytes32) {
         return _hashTypedDataV4(keccak256(abi.encode(ANSWER_TYPEHASH, QUESTION_HASH, jobs, observedAt, day)));
     }
 
-    /// @notice Anyone may relay one fresh, typed, signed answer per UTC day, at least 24h apart.
+    /// @notice Anyone may relay one fresh, typed, signed answer per UTC day.
     function submitOvertime(uint256 jobs, uint256 observedAt, uint256 day, bytes calldata signature)
         external
         nonReentrant
@@ -340,7 +403,6 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
                 || day != block.timestamp / 1 days || usedDay[day]
                 || ECDSA.recover(answerDigest(jobs, observedAt, day), signature) != oracleSigner
         ) revert InvalidAnswer();
-        _checkOvertimeCadence();
         usedDay[day] = true;
         lastAnswerAt = observedAt;
         // Cap before multiplying: even a signed uint256-max jobs count cannot overflow.
@@ -350,16 +412,11 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
     }
 
     function fallbackOvertime() external nonReentrant {
-        if (block.timestamp < lastAnswerAt + 2 days) revert TooSoon();
+        if (block.timestamp < Math.max(lastAnswerAt, lastOvertimeAt) + 2 days) revert TooSoon();
         uint256 day = block.timestamp / 1 days;
         if (usedDay[day]) revert TooSoon();
-        _checkOvertimeCadence();
         usedDay[day] = true;
         _overtime(day, 0, Math.min(fallbackDaily, fund / 50), true);
-    }
-
-    function _checkOvertimeCadence() private view {
-        if (lastOvertimeAt != 0 && block.timestamp < lastOvertimeAt + 1 days) revert TooSoon();
     }
 
     function _overtime(uint256 day, uint256 jobs, uint256 spend, bool isFallback) private {
@@ -367,8 +424,7 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
         fund -= spend;
         uint256 burnInput = spend / 2;
         if (burnInput != 0) {
-            uint256 strikeBought = _swap(address(imd), burnInput);
-            super._update(address(this), address(0), strikeBought);
+            _buyBurnOrDefer(burnInput);
         }
         if (spend != 0) _stream(spend - burnInput);
         emit Overtime(day, jobs, spend, isFallback);
@@ -413,8 +469,7 @@ contract Strike is ERC20, EIP712, ReentrancyGuard {
         fund -= spend;
         if (spend != 0) {
             if (winner == 0) {
-                uint256 strikeBought = _swap(address(imd), spend);
-                super._update(address(this), address(0), strikeBought);
+                _buyBurnOrDefer(spend);
             } else if (winner == 1) {
                 imd.safeTransfer(DEAD, spend);
             } else {

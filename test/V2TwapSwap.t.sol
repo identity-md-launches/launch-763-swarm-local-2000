@@ -116,6 +116,108 @@ contract V2TwapSwapTest is Test {
         assertGe(imd.balanceOf(address(token)), token.fund() + token.rewardLiability());
     }
 
+    function testTreasuryCustodyLeavesDonationsAndDoesNotChargeDues() public {
+        _warm();
+        token.transfer(address(adapter), 123 ether);
+        imd.mint(address(adapter), 456 ether);
+        vm.startPrank(alice);
+        token.approve(address(adapter), 1000 ether);
+        adapter.swap(address(token), 1000 ether, 970 ether, alice);
+        vm.stopPrank();
+        token.processFees(type(uint256).max, type(uint256).max);
+        uint256 now_ = vm.getBlockTimestamp();
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, token.answerDigest(1000, now_, now_ / 1 days));
+        token.submitOvertime(1000, now_, now_ / 1 days, abi.encodePacked(r, s, v));
+        assertEq(token.pendingStrikeBurn(), 0);
+        assertEq(token.pendingFund(), 0);
+        assertEq(token.pendingImdBurn(), 0);
+        assertEq(token.balanceOf(address(adapter)), 123 ether);
+        assertEq(imd.balanceOf(address(adapter)), 456 ether);
+    }
+
+    function testPublicSwapsCannotUseTreasuryCustodyOrTokenRecipients() public {
+        _warm();
+        address[3] memory forbidden = [address(adapter), address(token), address(imd)];
+        vm.startPrank(alice);
+        imd.approve(address(adapter), 1000 ether);
+        for (uint256 i; i < forbidden.length; ++i) {
+            vm.expectRevert(V2TwapSwap.InvalidSwap.selector);
+            adapter.swap(address(imd), 1000 ether, 970 ether, forbidden[i]);
+        }
+        vm.stopPrank();
+    }
+
+    function testDefaultBargainUsesValidV2Recipient() public {
+        _warm();
+        vm.prank(alice);
+        token.transfer(address(pair), 1000 ether);
+        pair.sync();
+        token.processFees(type(uint256).max, type(uint256).max);
+        vm.warp(token.genesis() + 7 days + 1);
+        _warm();
+        uint256 supply = token.totalSupply();
+        uint256 beforeFund = token.fund();
+        assertEq(token.executeBargain(0), 0);
+        assertEq(token.fund(), beforeFund - beforeFund / 100);
+        assertEq(token.pendingStrikeBurn(), 0);
+        assertLt(token.totalSupply(), supply);
+    }
+
+    function testThinPoolDefersBurnAndBoundedBatchesDrainIt() public {
+        _warm();
+        vm.startPrank(alice);
+        token.approve(address(adapter), 1000 ether);
+        adapter.swap(address(token), 1000 ether, 970 ether, alice);
+        vm.stopPrank();
+        token.processFees(type(uint256).max, type(uint256).max);
+        // Simulate liquidity withdrawal to the factory, leaving a thin 1:1 pool.
+        uint256 strikeWithdrawal = token.balanceOf(address(pair)) - 1 ether;
+        uint256 imdWithdrawal = imd.balanceOf(address(pair)) - 1 ether;
+        vm.startPrank(address(pair));
+        token.transfer(address(this), strikeWithdrawal);
+        imd.transfer(address(this), imdWithdrawal);
+        vm.stopPrank();
+        pair.sync();
+        vm.warp(vm.getBlockTimestamp() + 30 minutes);
+        adapter.updateOracle();
+        uint256 now_ = vm.getBlockTimestamp();
+        uint256 beforeFund = token.fund();
+        uint256 spend = beforeFund / 50;
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, token.answerDigest(1000, now_, now_ / 1 days));
+        token.submitOvertime(1000, now_, now_ / 1 days, abi.encodePacked(r, s, v));
+        assertEq(token.fund(), beforeFund - spend);
+        assertEq(token.pendingStrikeBurn(), spend / 2);
+        assertEq(token.streamBudget(), spend - spend / 2);
+        assertTrue(token.usedDay(now_ / 1 days));
+        uint256 supply = token.totalSupply();
+        uint256 batch = spend / 20 + 1;
+        for (uint256 i; i < 10; ++i) {
+            vm.warp(vm.getBlockTimestamp() + 30 minutes);
+            adapter.updateOracle();
+            token.processStrikeBurn(batch);
+        }
+        assertEq(token.pendingStrikeBurn(), 0);
+        assertLt(token.totalSupply(), supply);
+        assertEq(token.pendingFund(), 0);
+        assertEq(token.pendingImdBurn(), 0);
+        assertEq(imd.allowance(address(token), address(adapter)), 0);
+        assertGe(
+            imd.balanceOf(address(token)),
+            token.fund() + token.pendingStrikeBurn() + token.rewardLiability() + token.streamBudget()
+                - token.streamReleased()
+        );
+    }
+
+    function testGrossTwapFloorIncludesDuesAndLimitsPublicTradeSize() public {
+        _warm();
+        vm.startPrank(alice);
+        imd.approve(address(adapter), 150_000 ether);
+        vm.expectRevert(V2TwapSwap.InvalidSwap.selector);
+        adapter.swap(address(imd), 100_000 ether, 97_000 ether, alice);
+        assertGe(adapter.swap(address(imd), 50_000 ether, 48_500 ether, alice), 48_500 ether);
+        vm.stopPrank();
+    }
+
     function testSpotManipulationDoesNotReplaceTwap() public {
         _warm();
         uint256 oldQuote = adapter.quote(address(token), 1 ether);

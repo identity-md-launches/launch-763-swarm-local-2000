@@ -132,7 +132,11 @@ contract V2TwapSwap is IStrikeSwap, ReentrancyGuard {
         nonReentrant
         returns (uint256 output)
     {
-        if (amountIn == 0 || minOut == 0 || recipient == address(0) || recipient == address(pair)) {
+        bool treasury = msg.sender == strike && recipient == strike;
+        if (
+            amountIn == 0 || minOut == 0 || recipient == address(0) || recipient == address(pair)
+                || recipient == address(this) || recipient == imd || (recipient == strike && !treasury)
+        ) {
             revert InvalidSwap();
         }
         uint256 floor = Math.mulDiv(quote(tokenIn, amountIn), 9700, 10_000);
@@ -142,13 +146,25 @@ contract V2TwapSwap is IStrikeSwap, ReentrancyGuard {
         (uint256 reserveIn, uint256 reserveOut) = tokenIn == token0 ? (r0, r1) : (r1, r0);
         uint256 beforeInput = IERC20(tokenIn).balanceOf(address(pair));
         uint256 beforeOutput = IERC20(outputToken).balanceOf(recipient);
+        uint256 beforeCustody = treasury ? IERC20(outputToken).balanceOf(address(this)) : 0;
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(pair), amountIn);
         uint256 actualInput = IERC20(tokenIn).balanceOf(address(pair)) - beforeInput;
         if (actualInput == 0) revert InvalidSwap();
         uint256 withFee = actualInput * 997;
         uint256 grossOutput = Math.mulDiv(withFee, reserveOut, reserveIn * 1000 + withFee);
         if (grossOutput == 0 || grossOutput >= reserveOut) revert InvalidSwap();
-        pair.swap(tokenIn == token0 ? 0 : grossOutput, tokenIn == token0 ? grossOutput : 0, recipient, "");
+        // Genuine V2 pairs reject either token contract as `to`. Only treasury swaps use custody;
+        // public trades go directly to their recipient and retain the normal market dues.
+        pair.swap(
+            tokenIn == token0 ? 0 : grossOutput,
+            tokenIn == token0 ? grossOutput : 0,
+            treasury ? address(this) : recipient,
+            ""
+        );
+        if (treasury) {
+            uint256 received = IERC20(outputToken).balanceOf(address(this)) - beforeCustody;
+            IERC20(outputToken).safeTransfer(recipient, received);
+        }
         output = IERC20(outputToken).balanceOf(recipient) - beforeOutput;
         if (output < minOut) revert InvalidSwap();
         emit Swapped(msg.sender, tokenIn, amountIn, output);
