@@ -74,7 +74,8 @@ contract StrikeAdversarialTest is StrikeFixture {
                 strike.rewardLiability(),
                 strike.rewardPerWeight(),
                 strike.streamBudget(),
-                strike.streamReleased()
+                strike.streamReleased(),
+                strike.pendingStrikeBurn()
             )
         );
     }
@@ -331,22 +332,49 @@ contract StrikeAdversarialTest is StrikeFixture {
         strike.fallbackOvertime();
     }
 
-    function testBargainFailureRollsBackExecutionFlagAndCanBeRetried() public {
+    function testBargainDefersFailedBurnAndRetryCannotSpendOtherReserves() public {
         _fund();
+        vm.prank(actors[0]);
+        strike.stake(100 ether, 30);
+        _answer(10);
         vm.warp(strike.genesis() + 7 days);
         _warm();
-        bytes memory quote = abi.encodeCall(V2TwapSwap.quote, (address(reward), strike.fund() / 100));
+        uint256 fundBefore = strike.fund();
+        uint256 spend = fundBefore / 100;
+        uint256 imdBefore = reward.balanceOf(address(strike));
+        uint256 supplyBefore = strike.totalSupply();
+        uint256 earnedBefore = strike.earned(actors[0]);
+        bytes memory quote = abi.encodeCall(V2TwapSwap.quote, (address(reward), spend));
         vm.mockCall(address(swapper), quote, abi.encode(uint256(0)));
-        bytes32 state = _accountingHash();
-        vm.expectRevert(Strike.SwapFailed.selector);
-        strike.executeBargain(0);
-        (, bool executed) = strike.ballot(0);
-        assertFalse(executed);
-        assertEq(_accountingHash(), state);
-        vm.clearMockedCalls();
         assertEq(strike.executeBargain(0), 0);
-        (, executed) = strike.ballot(0);
+        (, bool executed) = strike.ballot(0);
         assertTrue(executed);
+        assertEq(strike.fund(), fundBefore - spend);
+        assertEq(strike.pendingStrikeBurn(), spend);
+        assertEq(reward.balanceOf(address(strike)), imdBefore);
+        assertEq(strike.totalSupply(), supplyBefore);
+        assertEq(strike.earned(actors[0]), earnedBefore);
+        bytes32 state = _accountingHash();
+        vm.expectRevert(Strike.InvalidVote.selector);
+        strike.executeBargain(0);
+        vm.expectRevert(Strike.SwapFailed.selector);
+        strike.processStrikeBurn(type(uint256).max);
+        assertEq(_accountingHash(), state);
+        assertEq(reward.allowance(address(strike), address(swapper)), 0);
+        vm.clearMockedCalls();
+        uint256 poolBefore = strike.balanceOf(address(pool));
+        // A nonprivileged keeper can drain only the earmarked amount, even with an unlimited bound.
+        vm.prank(actors[2]);
+        strike.processStrikeBurn(type(uint256).max);
+        assertEq(strike.pendingStrikeBurn(), 0);
+        assertEq(reward.balanceOf(address(strike)), imdBefore - spend);
+        assertEq(strike.fund(), fundBefore - spend);
+        assertEq(strike.totalStaked(), 100 ether);
+        assertEq(strike.earned(actors[0]), earnedBefore);
+        uint256 bought = poolBefore - strike.balanceOf(address(pool));
+        assertGt(bought, 0);
+        assertEq(supplyBefore - strike.totalSupply(), bought);
+        assertEq(reward.allowance(address(strike), address(swapper)), 0);
     }
 
     function testUnstakedAndOutOfRangeVotesAreRejected() public {

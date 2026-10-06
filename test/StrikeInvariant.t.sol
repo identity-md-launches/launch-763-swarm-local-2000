@@ -25,6 +25,16 @@ contract StrikeHandler is Test {
     uint256 public fundOutflows;
     uint256 public rewardsPaid;
     uint256 public burned;
+    uint256 public burnCommitted;
+    uint256 public burnSpent;
+    uint256 public scheduledRewards;
+    uint256 public checkpointAt;
+
+    struct RewardGrant {
+        uint256 amount;
+        uint256 start;
+    }
+    RewardGrant[] private grants;
     mapping(bytes4 => uint256) public calls;
     uint256 private constant SIGNER_KEY = 0x5151;
 
@@ -35,6 +45,23 @@ contract StrikeHandler is Test {
         adapter = V2TwapSwap(address(t.swapAdapter()));
         pair = PairModel(t.market());
         actors = users;
+    }
+
+    // Independent history of funded grants: never read the contract's private tranche bookkeeping.
+    function vestedRewards(uint256 at) public view returns (uint256 vested) {
+        for (uint256 i; i < grants.length; ++i) {
+            RewardGrant memory grant = grants[i];
+            if (at <= grant.start) continue;
+            uint256 age = at - grant.start;
+            vested += age >= 7 days ? grant.amount : grant.amount * age / 7 days;
+        }
+    }
+
+    function _schedule(uint256 amount) private {
+        if (amount == 0) return;
+        grants.push(RewardGrant(amount, vm.getBlockTimestamp()));
+        scheduledRewards += amount;
+        checkpointAt = vm.getBlockTimestamp();
     }
 
     function advance(uint256 elapsed) public {
@@ -93,6 +120,7 @@ contract StrikeHandler is Test {
         vm.prank(user);
         token.stake(amount, terms[term % 4]);
         deposited += amount;
+        checkpointAt = vm.getBlockTimestamp();
         assertEq(token.holdStart(user), seniority, "staking reset seniority");
         calls[this.deposit.selector]++;
     }
@@ -113,6 +141,7 @@ contract StrikeHandler is Test {
         uint256 accrued = token.earned(user);
         vm.prank(user);
         token.exit();
+        checkpointAt = vm.getBlockTimestamp();
         assertEq(token.balanceOf(user) - liquid, amount - penalty, "incorrect principal returned");
         uint256 paid = imd.balanceOf(user) - beforeReward;
         assertEq(paid, vm.getBlockTimestamp() < unlockAt ? 0 : accrued, "incorrect exit reward");
@@ -137,6 +166,7 @@ contract StrikeHandler is Test {
         uint256 earned = token.earned(user);
         vm.prank(user);
         uint256 paid = token.claim();
+        checkpointAt = vm.getBlockTimestamp();
         assertEq(paid, earned);
         assertEq(imd.balanceOf(user) - beforeReward, paid);
         rewardsPaid += paid;
@@ -155,11 +185,21 @@ contract StrikeHandler is Test {
     }
 
     function overtime(uint256 jobs, bool fallbackMode) public {
-        _warm();
         uint256 now_ = vm.getBlockTimestamp();
         uint256 day = now_ / 1 days;
-        if (token.usedDay(day) || (token.lastOvertimeAt() != 0 && now_ < token.lastOvertimeAt() + 1 days)) return;
-        if (fallbackMode && now_ < token.lastAnswerAt() + 2 days) return;
+        if (token.usedDay(day)) return;
+        if (fallbackMode) {
+            uint256 latest =
+                token.lastAnswerAt() > token.lastOvertimeAt() ? token.lastAnswerAt() : token.lastOvertimeAt();
+            if (now_ < latest + 2 days) return;
+        }
+        uint256 cap = token.fund() / 50;
+        uint256 spend;
+        if (fallbackMode) spend = cap < token.fallbackDaily() ? cap : token.fallbackDaily();
+        else spend = jobs > cap / token.jobsRate() ? cap : jobs * token.jobsRate();
+        uint256 fundBefore = token.fund();
+        uint256 returnedToFund =
+            spend != 0 && token.totalWeight() == 0 ? vestedRewards(now_) - vestedRewards(checkpointAt) : 0;
         uint256 beforeReward = imd.balanceOf(address(token));
         uint256 beforePool = token.balanceOf(address(pair));
         if (fallbackMode) {
@@ -168,10 +208,39 @@ contract StrikeHandler is Test {
             (uint8 v, bytes32 r, bytes32 s) = vm.sign(SIGNER_KEY, token.answerDigest(jobs, now_, day));
             token.submitOvertime(jobs, now_, day, abi.encodePacked(r, s, v));
         }
-        fundOutflows += beforeReward - imd.balanceOf(address(token));
+        uint256 spent = beforeReward - imd.balanceOf(address(token));
+        fundOutflows += spent;
+        burnCommitted += spend / 2;
+        burnSpent += spent;
+        _schedule(spend - spend / 2);
+        assertEq(token.fund(), fundBefore - spend + returnedToFund);
         burned += beforePool - token.balanceOf(address(pair));
         assertTrue(token.usedDay(day));
         calls[this.overtime.selector]++;
+    }
+
+    function retryBurn(uint256 seed, bool refreshOracle) public {
+        uint256 queued = token.pendingStrikeBurn();
+        if (queued < 10_000) return; // Dust and empty retries have dedicated unit coverage.
+        uint256 input = bound(seed, 10_000, queued);
+        if (refreshOracle) _warm();
+        uint256 beforeReward = imd.balanceOf(address(token));
+        uint256 beforePool = token.balanceOf(address(pair));
+        if (!adapter.ready() || vm.getBlockTimestamp() - adapter.observationAt() > 2 hours) {
+            vm.expectRevert(V2TwapSwap.OracleNotReady.selector);
+            token.processStrikeBurn(input);
+            assertEq(token.pendingStrikeBurn(), queued);
+            assertEq(imd.balanceOf(address(token)), beforeReward);
+            assertEq(token.balanceOf(address(pair)), beforePool);
+        } else {
+            token.processStrikeBurn(input);
+            assertEq(beforeReward - imd.balanceOf(address(token)), input);
+            assertEq(token.pendingStrikeBurn(), queued - input);
+            burnSpent += input;
+            fundOutflows += input;
+            burned += beforePool - token.balanceOf(address(pair));
+        }
+        calls[this.retryBurn.selector]++;
     }
 
     function vote(uint256 who, uint256 option) public {
@@ -189,13 +258,18 @@ contract StrikeHandler is Test {
         if (week == 0) return;
         (, bool executed) = token.ballot(week - 1);
         if (executed) return;
-        _warm();
-        // Warming can cross the week boundary.
-        week = token.currentWeek();
+        uint256 spend = token.fund() / 100;
         uint256 beforeReward = imd.balanceOf(address(token));
         uint256 beforePool = token.balanceOf(address(pair));
-        token.executeBargain(week - 1);
-        fundOutflows += beforeReward - imd.balanceOf(address(token));
+        uint8 winner = token.executeBargain(week - 1);
+        uint256 spent = beforeReward - imd.balanceOf(address(token));
+        fundOutflows += spent;
+        if (winner == 0) {
+            burnCommitted += spend;
+            burnSpent += spent;
+        } else if (winner == 2) {
+            _schedule(spend);
+        }
         burned += beforePool - token.balanceOf(address(pair));
         (, executed) = token.ballot(week - 1);
         assertTrue(executed);
@@ -240,7 +314,7 @@ contract StrikeInvariantTest is StrikeFixture {
     function setUp() public override {
         super.setUp();
         handler = new StrikeHandler(strike, reward, card, actors);
-        bytes4[] memory selectors = new bytes4[](12);
+        bytes4[] memory selectors = new bytes4[](13);
         selectors[0] = handler.advance.selector;
         selectors[1] = handler.trade.selector;
         selectors[2] = handler.transferOrBurn.selector;
@@ -253,6 +327,7 @@ contract StrikeInvariantTest is StrikeFixture {
         selectors[9] = handler.bargain.selector;
         selectors[10] = handler.donate.selector;
         selectors[11] = handler.mintCard.selector;
+        selectors[12] = handler.retryBurn.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
         // Seed nonempty positions, fees and a stream, so every run starts with obligations.
@@ -268,7 +343,8 @@ contract StrikeInvariantTest is StrikeFixture {
             strike.balanceOf(address(strike)),
             strike.totalStaked() + strike.pendingFund() + strike.pendingImdBurn() + handler.strikeDonations()
         );
-        uint256 reserved = strike.fund() + strike.rewardLiability() + strike.streamBudget() - strike.streamReleased();
+        uint256 reserved = strike.fund() + strike.pendingStrikeBurn() + strike.rewardLiability() + strike.streamBudget()
+            - strike.streamReleased();
         assertEq(reward.balanceOf(address(strike)), reserved + handler.imdDonations());
         assertEq(
             handler.netFees() + handler.imdDonations(),
@@ -279,13 +355,13 @@ contract StrikeInvariantTest is StrikeFixture {
         for (uint256 i; i < actors.length; ++i) {
             earned += strike.earned(actors[i]);
         }
-        uint256 uncheckpointed;
-        if (strike.streamEnd() != 0) {
-            uint256 until = block.timestamp < strike.streamEnd() ? block.timestamp : strike.streamEnd();
-            uint256 vested = strike.streamBudget() * (until - strike.streamStart()) / 7 days;
-            uncheckpointed = vested - strike.streamReleased();
-        }
+        uint256 vested = handler.vestedRewards(vm.getBlockTimestamp());
+        uint256 checkpointed = handler.vestedRewards(handler.checkpointAt());
+        assertEq(strike.streamBudget() - strike.streamReleased(), handler.scheduledRewards() - checkpointed);
+        assertEq(strike.pendingStrikeBurn(), handler.burnCommitted() - handler.burnSpent());
+        uint256 uncheckpointed = vested - checkpointed;
         assertLe(earned, strike.rewardLiability() + uncheckpointed, "unvested rewards became claimable");
+        assertLe(handler.rewardsPaid() + earned, vested, "rewards exceed independently vested grants");
     }
 
     function invariant_positionsAndPrincipalMatchIndependentDeposits() public view {
@@ -356,6 +432,79 @@ contract StrikeInvariantTest is StrikeFixture {
         assertGt(handler.calls(handler.bargain.selector), 0);
         assertGt(handler.calls(handler.overtime.selector), 2);
         assertGt(handler.rewardsPaid(), 0);
+        afterInvariant();
+    }
+
+    function testHandlerOverlappingGrantsKeepOriginalVestingDeadlines() public {
+        uint256 first = handler.scheduledRewards();
+        handler.advance(1 days);
+        handler.overtime(type(uint256).max, false);
+        uint256 second = handler.scheduledRewards() - first;
+        assertGt(first, 0);
+        assertGt(second, 0);
+        handler.advance(6 days);
+        assertApproxEqAbs(strike.earned(actors[0]) + strike.earned(actors[1]), first + second * 6 / 7, 4);
+        invariant_treasuryExactlyBacksPrincipalFeesRewardsAndDonations();
+        handler.advance(1 days);
+        assertApproxEqAbs(strike.earned(actors[0]) + strike.earned(actors[1]), first + second, 4);
+        invariant_treasuryExactlyBacksPrincipalFeesRewardsAndDonations();
+        afterInvariant();
+    }
+
+    function testHandlerAccountsForVestingWhenNoStakersRemain() public {
+        handler.withdraw(0);
+        handler.withdraw(1);
+        assertEq(strike.totalStaked(), 0);
+        uint256 grant = handler.scheduledRewards();
+        handler.advance(7 days);
+        uint256 fundBefore = strike.fund();
+        handler.overtime(type(uint256).max, false);
+        assertEq(strike.fund(), fundBefore - fundBefore / 50 + grant);
+        invariant_treasuryExactlyBacksPrincipalFeesRewardsAndDonations();
+        afterInvariant();
+    }
+
+    function testHandlerRetriesQueuedBurnsWithoutConsumingRewards() public {
+        handler.advance(1 days);
+        handler.overtime(type(uint256).max, false);
+        uint256 queued = strike.pendingStrikeBurn();
+        uint256 imdBefore = reward.balanceOf(address(strike));
+        uint256 supplyBefore = strike.totalSupply();
+        assertGt(queued, 20_000);
+        handler.retryBurn(queued, false);
+        assertEq(strike.pendingStrikeBurn(), queued);
+        assertEq(reward.balanceOf(address(strike)), imdBefore);
+        assertEq(strike.totalSupply(), supplyBefore);
+        invariant_treasuryExactlyBacksPrincipalFeesRewardsAndDonations();
+        handler.retryBurn(queued / 2, true);
+        assertEq(strike.pendingStrikeBurn(), queued - queued / 2);
+        invariant_treasuryExactlyBacksPrincipalFeesRewardsAndDonations();
+        handler.retryBurn(strike.pendingStrikeBurn(), true);
+        assertEq(strike.pendingStrikeBurn(), 0);
+        assertEq(reward.balanceOf(address(strike)), imdBefore - queued);
+        assertEq(handler.calls(handler.retryBurn.selector), 3);
+        afterInvariant();
+    }
+
+    function testHandlerAllowsAdjacentUtcDaysAndRespectsFallbackRecovery() public {
+        uint256 callsBefore = handler.calls(handler.overtime.selector);
+        uint256 nextDay = (vm.getBlockTimestamp() / 1 days + 1) * 1 days;
+        handler.advance(nextDay - vm.getBlockTimestamp());
+        handler.overtime(0, false);
+        assertEq(handler.calls(handler.overtime.selector), callsBefore + 1);
+        assertTrue(strike.usedDay(nextDay / 1 days));
+        handler.advance(2 days);
+        handler.overtime(0, true);
+        assertEq(handler.calls(handler.overtime.selector), callsBefore + 2);
+        uint256 fallbackAt = strike.lastOvertimeAt();
+        handler.advance(1 days);
+        handler.overtime(0, true);
+        assertEq(strike.lastOvertimeAt(), fallbackAt);
+        assertEq(handler.calls(handler.overtime.selector), callsBefore + 2);
+        // The signer can recover on the day reserved by the fallback cooldown.
+        handler.overtime(0, false);
+        assertEq(handler.calls(handler.overtime.selector), callsBefore + 3);
+        assertEq(strike.lastAnswerAt(), vm.getBlockTimestamp());
         afterInvariant();
     }
 }
