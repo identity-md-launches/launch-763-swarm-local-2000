@@ -1,0 +1,35 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "Strike",
+    "name": "Swarm Local 2000",
+    "symbol": "STRIKE",
+    "decimals": 18,
+    "constructorArgs": [
+      "$factory",
+      "$poolManager",
+      "$launchNumber",
+      "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+      "0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f",
+      "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f",
+      "0x5598aa9146215bc13eb26f2c692ad1461fd32982",
+      "1000000000000000000",
+      "1000000000000000000"
+    ],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [
+    {
+      "contract": "UnionCard",
+      "constructorArgs": ["$token"]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "125270724187523965593206900"
+  },
+  "economics": {"poolBps":8800,"initialMarketCapWei":"2500000000000000000000","remainderTo":"0xcc242e943cb785794f93acaa835307fabae84bd4"},
+  "notes": "Strike mints 1,000,000,000 STRIKE with 18 decimals once to msg.sender, which must be the launch factory. No later mint, owner authority, pause, blacklist, transfer limits or proxy exists. Constructor order is factory, poolManager, launchNumber, imd, v2Factory, pairInitCodeHash, oracleSigner, jobsRate, fallbackDaily. Strike creates V2TwapSwap internally; UnionCard($token) is the only separately deployed application. No initialization calls are included. The IMD address is published at https://imd.fun/token/. The V2 factory is the Ethereum mainnet deployment at https://developers.uniswap.org/docs/protocols/v2/deployments; its pair hash comes from https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol. Ethereum dependency selection is a manifest assumption, not a chainId override. The oracle signer is the public attester returned by https://api.imd.fun/oracle/requests?limit=1 on 2026-10-06. The unspecified jobsRate and fallbackDaily are selected as 1000000000000000000 IMD minor units per job and per fallback day respectively, each subject to the implemented 2% fund cap. These are explicit integration choices, not supplied requester rates. Strike requires its own Overtime EIP-712 message and domain; the public IdentityMD OracleAttestation format documented at https://imd.fun/docs/ is incompatible. This manifest does not establish that the published signer will sign Strike's format. Fallback becomes callable after 48 hours without an answer. The 2% dues apply only to the separately predicted V2 STRIKE/IMD market: 0.5% STRIKE burn, 0.5% accrued for an IMD sink transfer, and 1% accrued for the fund. Launch factory, distributor and v4 PoolManager flows are exempt, so the launch pool's buys/sells are untaxed. Treasury swaps are separate from transfers. The V2 market needs separate liquidity and permissionless preparation and TWAP observations; launch liquidity does not fund it. V2TwapSwap uses a 30-minute TWAP, two-hour quote expiry and 97% minimum output. Strike implements wallet seniority, 7/30/90/180-day weighted stakes, maturity-only reward claims, 20% early-exit principal burns, reward forfeiture, seven-day streams and weekly bargaining with ties selecting A. UnionCard supplies free soulbound holder/staker cards with live rank/stake, gremlin artwork and gold status from the Identity MD NFT at 0x0000ec93127baa929e58e97dd0095a2bfb38ec1d. LP destruction is external to these contracts and is not demonstrated by this manifest. initialPrice is provenance only: floor(sqrt(initialMarketCapWei / totalSupply) * 2^96), expressing IMD minor units per STRIKE minor unit before currency sorting. The deployer derives the actual opening price and orientation from the supplied economics and token addresses."
+}
